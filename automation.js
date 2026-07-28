@@ -22,10 +22,15 @@ function extractAndMergeCookies(headers, currentCookies) {
       (currentCookies || '')
         .split('; ')
         .filter(Boolean)
-        .map(cookie => cookie.split('='))
+        .map(cookie => {
+          const index = cookie.indexOf('=');
+          return [cookie.slice(0, index), cookie.slice(index + 1)];
+        })
     );
     newCookies.forEach(cookie => {
-      const [key, value] = cookie.split('=');
+      const index = cookie.indexOf('=');
+      const key = cookie.slice(0, index);
+      const value = cookie.slice(index + 1);
       cookieMap.set(key, value);
     });
     return Array.from(cookieMap.entries()).map(([key, value]) => `${key}=${value}`).join('; ');
@@ -92,19 +97,43 @@ async function automateLogin({r,p}, ipAddress) {
       throwHttpErrors: false,
     });
 
+    console.log('Step 2: Login response status:', response.statusCode);
+    console.log('Step 2: Login response location:', response.headers.location);
     cookies = extractAndMergeCookies(response.headers, cookies);
     console.log('Step 2: Retrieved token and updated cookies:', cookies);
 
-    const match = response.body.match(/\/student\/home\/([a-zA-Z0-9]+)/);
+    const location = response.headers.location;
+    if (location && location.includes('/student/login')) {
+      throw new Error('Invalid Roll Number or Password.');
+    }
+
     let studentHash = "";
-    if (match && match[1]) {
-      studentHash = match[1];
-      console.log('Extracted Student Hash:', studentHash);
-    } else {
-      if (response.body.includes('Invalid Roll No or Password')) {
-          throw new Error('Invalid Roll Number or Password.');
+    if (location) {
+      const locationMatch = location.match(/\/student\/home\/([^/?]+)/);
+      if (locationMatch && locationMatch[1]) {
+        studentHash = locationMatch[1];
+        console.log('Extracted Student Hash from redirect:', studentHash);
       }
-      throw new Error('Could not extract student hash from the login response.');
+    }
+
+    if (!studentHash) {
+      const bodyMatch = response.body.match(/\/student\/home\/([^"'>\s]+)/);
+      if (bodyMatch && bodyMatch[1]) {
+        studentHash = bodyMatch[1];
+        console.log('Extracted Student Hash from body:', studentHash);
+      }
+    }
+
+    if (!studentHash) {
+      const invalidIndicators = ['Invalid Roll No or Password', 'Invalid roll no', 'Invalid password', 'Invalid credentials', '/student/login'];
+      const foundInvalid = invalidIndicators.some(indicator => response.body.includes(indicator));
+      if (foundInvalid) {
+        throw new Error('Invalid Roll Number or Password.');
+      }
+      if (response.statusCode === 302) {
+        throw new Error(`Unexpected login redirect: ${location || 'no location header'}`);
+      }
+      throw new Error(`Could not extract student hash from login response. status=${response.statusCode}`);
     }
 
     return { cookies, studentHash };
@@ -184,54 +213,52 @@ async function fetchTrackedCourses(cookies, studentHash, ipAddress, courseCodes)
     const parsedCourses = new Map(
       courseCodes.map(code => {
         const [courseCode, courseSlot] = code.split(":");
-        return [courseCode, courseSlot];
+        if (!courseCode || !courseSlot) {
+          throw new Error(`Invalid course entry: ${code}. Expected format COURSE_CODE:SECTION`);
+        }
+        return [courseCode.trim().toUpperCase(), courseSlot.trim().toUpperCase()];
       })
     );
 
-    $("div.elective-subjects.table-responsive table.table-hover.table-bordered tbody tr:not(.setHeader)").each((_, row) => {
+    $("table tbody tr").each((_, row) => {
       const cells = $(row).find("td");
-      if (cells.length === 6) {
-        const courseCode = $(cells[1]).text().trim();
-        // console.log(`Processing Course: ${courseCode}`);
-        const courseSlot = $(cells[3]).text().trim();
-        // console.log(`Course Slot: ${courseSlot}`);
-        const seats = parseInt($(cells[4]).text().trim(), 10) || 0;
-        // console.log(`Available Seats: ${seats}`);
-        const formAction = $(cells[5]).find("form").attr("action");
-        // console.log(`Form Action: ${formAction}`);
-        if (formAction) {
-          const courseHashMatch = formAction.match(new RegExp(`/student/courseRegister/${studentHash}/([a-zA-Z0-9]+)`));
+      if (cells.length >= 4) {
+        const courseCode = $(cells[1]).text().trim().toUpperCase();
+        const courseSlot = $(cells[3]).text().trim().toUpperCase();
+        const seats = parseInt($(cells[4]).text().trim().replace(/\D/g, ''), 10) || 0;
+        const formAction = cells.length > 5 ? $(cells[5]).find("form").attr("action") : null;
+
+        if (parsedCourses.has(courseCode) && parsedCourses.get(courseCode) === courseSlot) {
+          const courseKey = `${courseCode}|${courseSlot}`;
+          const courseHashMatch = formAction ? formAction.match(new RegExp(`/student/courseRegister/${studentHash}/([^/?]+)`)) : null;
           const courseHash = courseHashMatch ? courseHashMatch[1] : null;
 
-          if (courseHash && parsedCourses.has(courseCode) && parsedCourses.get(courseCode) === courseSlot) {
-            trackedCourses.set(courseHash, {
-              courseCode,
-              courseSlot,
-              seats,
-            });
-            parsedCourses.delete(courseCode); // Remove found 
-            console.log(`Tracking Course: ${courseCode} (Slot: ${courseSlot}) with Hash: ${courseHash} and Seats: ${seats}`);
-          }
+          trackedCourses.set(courseKey, {
+            courseCode,
+            courseSlot,
+            seats,
+            courseHash,
+          });
+          parsedCourses.delete(courseCode);
+          console.log(`Tracking Course: ${courseCode} (Slot: ${courseSlot}) with Hash: ${courseHash || 'pending'} and Seats: ${seats}`);
         }
       }
     });
 
     // Check for courses that were not found
-    // console.log(parsedCourses);
     if (parsedCourses.size > 0) {
       const notFound = Array.from(parsedCourses.keys()).join(', ');
       throw new Error(`The following course(s) were not found: ${notFound}. Please check the course code and slot.`);
     }
-    // console.log(`Total Courses Being Tracked: ${trackedCourses}`);
     return trackedCourses;
   } catch (error) {
     console.error("Error processing courses:", error);
-    return new Map();
+    throw error;
   }
 }
 
 // Function to Send POST Request for Course Registration
-const sendPostReq = async (cookies, studentHash, ipAddress, courseHash) => {
+const sendPostReq = async (cookies, studentHash, ipAddress, courseHash, callbacks) => {
   const { default: got } = await import('got');
 
   try {
@@ -242,15 +269,59 @@ const sendPostReq = async (cookies, studentHash, ipAddress, courseHash) => {
         'Cookie': cookies,
         'Content-Length': '0',
       },
-      responseType: "text",
+      responseType: 'text',
       agent: { https: httpsAgent },
       throwHttpErrors: false,
       followRedirect: false,
     });
 
-    console.log(`POST Request to register course ${courseHash} - Status Code: ${response.statusCode}`);
+    const status = response.statusCode;
+    const location = response.headers.location || '';
+    const body = response.body || '';
+    const lowerBody = body.toLowerCase();
+
+    callbacks.onStatusUpdate(`Registration request sent for ${courseHash} (status ${status}).`);
+    console.log(`POST Request to register course ${courseHash} - Status Code: ${status}`);
+
+    const successIndicators = [
+      'successfully registered',
+      'registered successfully',
+      'registration successful',
+      'you have successfully registered',
+      'you are successfully enrolled',
+      'enrolled successfully',
+      'course registration successful',
+      'course registered successfully',
+    ];
+
+    const failureIndicators = [
+      'invalid',
+      'error',
+      'could not',
+      'cannot',
+      'already registered',
+      'blocked',
+      'not eligible',
+      'session expired',
+      'login',
+    ];
+
+    const bodyHasSuccess = successIndicators.some(text => lowerBody.includes(text));
+    const bodyHasFailure = failureIndicators.some(text => lowerBody.includes(text));
+
+    const success = (status === 302 && !location.includes('/student/login'))
+      || bodyHasSuccess
+      || (status === 200 && body.includes('alert-success'));
+
+    if (success && bodyHasFailure && !bodyHasSuccess) {
+      return { success: false, status, location, body };
+    }
+
+    return { success, status, location, body };
   } catch (error) {
-    console.error("Error sending POST request:", error.message);
+    callbacks.onStatusUpdate(`Registration request error for ${courseHash}: ${error.message}`);
+    console.error('Error sending POST request:', error.message);
+    return { success: false, status: null, location: null, body: '' };
   }
 };
 
@@ -296,29 +367,22 @@ const handlerLogic = async (session, ipAddress, trackedCourses, autoLogin, crede
         callbacks.onStatusUpdate(`Alert: ${alertDiv.text().trim()}`);
       }
 
-      $("tr[bgcolor='#0ff288']").each((_, element) => {
-        const courseHashMatch = $(element).find("form[action*='/student/courseRegister/']").attr("action")?.match(/\/([a-f0-9]{24})$/);
-        if (courseHashMatch) {
-          const courseHash = courseHashMatch[1];
-          if (trackedCourses.has(courseHash)) {
-            const removedCourse = trackedCourses.get(courseHash);
-            trackedCourses.delete(courseHash);
-            callbacks.onCourseRegistered(removedCourse);
-            callbacks.onStatusUpdate(`Course Already Registered: ${removedCourse.courseCode} - Dropping from tracking.`);
-          }
-        }
-      });
+        $("tr").each((_, element) => {
+        const formAction = $(element).find("form[action*='/student/courseRegister/']").attr("action");
+        const courseHashMatch = formAction?.match(/\/student\/courseRegister\/[^/]+\/([^/?]+)/);
+        if (!courseHashMatch) return;
 
-      $("tr[bgcolor='#d4d3d2']").each((_, element) => {
-        const courseHashMatch = $(element).find("form[action*='/student/courseRegister/']").attr("action")?.match(/\/([a-f0-9]{24})$/);
-        if (courseHashMatch) {
-          const courseHash = courseHashMatch[1];
-          if (trackedCourses.has(courseHash)) {
-            const blockedCourse = trackedCourses.get(courseHash);
-            trackedCourses.delete(courseHash);
-            callbacks.onCourseBlocked(blockedCourse);
-            callbacks.onStatusUpdate(`Course is Blocked: ${blockedCourse.courseCode} - Dropping from tracking.`);
-          }
+        const courseHash = courseHashMatch[1];
+        const trackedEntry = Array.from(trackedCourses.entries()).find(([, data]) => data.courseHash === courseHash);
+        if (!trackedEntry) return;
+
+        const [courseKey, trackedCourse] = trackedEntry;
+        const row = $(element);
+        const rowText = row.text().toLowerCase();
+        if (rowText.includes('blocked') || row.attr('bgcolor') === '#d4d3d2') {
+          trackedCourses.delete(courseKey);
+          callbacks.onCourseBlocked(trackedCourse);
+          callbacks.onStatusUpdate(`Course is Blocked: ${trackedCourse.courseCode} - Dropping from tracking.`);
         }
       });
 
@@ -371,22 +435,40 @@ const handlerLogic = async (session, ipAddress, trackedCourses, autoLogin, crede
         for (const row of slotRows) {
           if (!isRunning) return;
           const cells = $(row).find("td");
-          const courseCode = $(cells[1]).text().trim();
-          const courseData = courses.find(c => c.courseCode === courseCode);
+          const courseCode = $(cells[1]).text().trim().toUpperCase();
+          const courseSlotText = $(cells[3]).text().trim().toUpperCase();
+          const courseKey = `${courseCode}|${courseSlotText}`;
+          const courseData = trackedCourses.get(courseKey);
 
           if (courseData) {
-            const { courseHash, seats: trackedSeats } = courseData;
-            const newSeats = parseInt($(cells[4]).text().trim(), 10) || 0;
+            const newSeats = parseInt($(cells[4]).text().trim().replace(/\D/g, ''), 10) || 0;
 
-            if (newSeats !== trackedSeats) {
+            if (newSeats !== courseData.seats) {
               const updatedCourseData = { ...courseData, seats: newSeats };
-              trackedCourses.set(courseHash, updatedCourseData);
-              callbacks.onStatusUpdate(`Seat Update: ${courseCode} (${courseData.courseSlot}) - Seats: ${trackedSeats} -> ${newSeats}`);
+              trackedCourses.set(courseKey, updatedCourseData);
+              callbacks.onStatusUpdate(`Seat Update: ${courseCode} (${courseData.courseSlot}) - Seats: ${courseData.seats} -> ${newSeats}`);
             }
 
-            if (newSeats > 0) {
-              await sendPostReq(currentSession.cookies, currentSession.studentHash, ipAddress, courseHash);
+            const formAction = cells.length > 5 ? $(cells[5]).find("form").attr("action") : null;
+            if (!courseData.courseHash && formAction) {
+              const courseHashMatch = formAction.match(/\/student\/courseRegister\/[^/]+\/([^/?]+)/);
+              if (courseHashMatch) {
+                courseData.courseHash = courseHashMatch[1];
+                trackedCourses.set(courseKey, courseData);
+                callbacks.onStatusUpdate(`Registration opened for ${courseCode}. Course hash acquired.`);
+              }
+            }
+
+            if (newSeats > 0 && courseData.courseHash) {
+              const result = await sendPostReq(currentSession.cookies, currentSession.studentHash, ipAddress, courseData.courseHash, callbacks);
               callbacks.onStatusUpdate(`Attempting to register for ${courseCode}...`);
+              if (result.success) {
+                trackedCourses.delete(courseKey);
+                callbacks.onCourseRegistered(courseData);
+                callbacks.onStatusUpdate(`Course registered successfully: ${courseCode} (${courseSlotText}).`);
+              } else {
+                callbacks.onStatusUpdate(`Registration request may have failed for ${courseCode}. Retrying later.`);
+              }
               registeredSomething = true;
               break;
             }
